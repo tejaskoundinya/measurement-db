@@ -21,7 +21,9 @@ import type { BenchmarkIrt } from "@/content/benchmark-irt";
 import { withBase } from "@/lib/base-path";
 import { readGallerySource } from "@/lib/gallery-source";
 import { gallerySource, readGalleryLookup } from "@/lib/gallery-lookup";
+import type { Trace } from "@/lib/traces/display";
 import { IrtPanel } from "./irt-panel";
+import { TraceViewer } from "./trace-viewer";
 import {
   JoinedMatrix,
   type JoinedPick,
@@ -755,7 +757,7 @@ export function MatrixViewer({
   const [dataError, setDataError] = useState<string | null>(null);
   const [directAnswers, setDirectAnswers] = useState<{
     key: string;
-    texts: (string | null)[];
+    texts: (string | Trace | null)[];
   } | null>(null);
   const rowKind = bundle.chart?.rowKind ?? "subject";
   const categorical = Boolean(categories && categories.length);
@@ -1182,13 +1184,11 @@ export function MatrixViewer({
     void Promise.all(
       wanted.map(async (key) => {
         if (!key) return null;
-        const answer = await readCellData<{ trace: string | null }>(
-          dataUrl,
-          "answer",
-          key,
-          controller.signal,
-        );
-        return answer?.trace ?? null;
+        const answer = await readCellData<{
+          trace: string | null;
+          structured?: Trace;
+        }>(dataUrl, "answer", key, controller.signal);
+        return answer?.structured ?? answer?.trace ?? null;
       }),
     )
       .then((texts) => {
@@ -1685,10 +1685,10 @@ export function MatrixViewer({
               vote went the way it did. */}
           {hasTraces ? (
             <div
-              className={`mt-4 grid gap-4 ${answerPanes.length > 1 ? "lg:grid-cols-2" : ""}`}
+              className={`mt-4 grid gap-4 ${answerPanes.length > 1 && !answerPanes.some((p) => typeof p.text === "object" && p.text) ? "lg:grid-cols-2" : ""}`}
             >
               {answerPanes.map((pane) => (
-                <div key={pane.key}>
+                <div key={pane.key} className="min-w-0">
                   <p className="mb-1 flex items-baseline gap-2 text-[0.6875rem] uppercase tracking-wide text-[var(--muted)]">
                     {pane.heading}
                     {pane.name ? (
@@ -1701,6 +1701,8 @@ export function MatrixViewer({
                     <p className="rounded bg-white p-4 text-[0.8125rem] text-[var(--muted)]">
                       Loading answer…
                     </p>
+                  ) : pane.state === "answer" && typeof pane.text === "object" && pane.text ? (
+                    <TraceViewer trace={pane.text} />
                   ) : pane.state === "answer" ? (
                     <div className="max-h-[32rem] overflow-auto break-words rounded bg-white p-4 text-[0.8125rem] leading-6 text-[var(--ink)]">
                       <MathText text={pane.text as string} />
