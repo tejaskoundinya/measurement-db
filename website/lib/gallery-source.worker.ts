@@ -178,7 +178,11 @@ self.onmessage = async ({
           console.warn("Could not read trace/1 value", base, key, error);
         }
       }
-      if (trace != null && !structured && Array.from(trace).length > TRACE_MAX_CHARS) {
+      if (
+        trace != null &&
+        !structured &&
+        Array.from(trace).length > TRACE_MAX_CHARS
+      ) {
         const chars = Array.from(trace).slice(0, TRACE_MAX_CHARS);
         const space = chars.lastIndexOf(" ");
         trace =

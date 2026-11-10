@@ -44,7 +44,12 @@ assert.deepEqual(
 );
 
 // Anything that is not a trace/1 value is rejected, so the worker falls back to raw text.
-for (const value of [null, "text", { schema: "trace/2", steps: [] }, { schema: "trace/1" }])
+for (const value of [
+  null,
+  "text",
+  { schema: "trace/2", steps: [] },
+  { schema: "trace/1" },
+])
   assert.throws(() => displayTrace(value));
 
 console.log("trace/1 display caps, test ordering and rejection passed.");

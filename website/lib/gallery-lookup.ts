@@ -1,9 +1,6 @@
 export type GallerySource = {
   dynamicItems: boolean;
-  tables: Record<
-    string,
-    { size: number; columns: string[]; format?: string }
-  >;
+  tables: Record<string, { size: number; columns: string[]; format?: string }>;
   lookupPack?: { index: string };
 };
 
