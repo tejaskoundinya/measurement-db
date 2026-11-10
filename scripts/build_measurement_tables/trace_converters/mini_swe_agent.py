@@ -141,6 +141,12 @@ def _tool(call_id, output: str, extra: dict, calls: dict, counts: Counter, nativ
         end=extra.get("timestamp"), native=native)) | {"output": output}
 
 
+def _recorded_cost(cost, tokens) -> bool:
+    """A cost of 0 for a call that used tokens means the harness did not price it
+    (e.g. a model missing from its price table), not that it was free."""
+    return cost is not None and not (cost == 0 and any(n for n in tokens if isinstance(n, (int, float))))
+
+
 def convert(trajectory: dict, evaluation: dict | None = None, native: dict | None = None
             ) -> tuple[dict, Counter]:
     """Convert one mini-swe-agent trajectory (+ its evaluation record) to trace/1."""
@@ -152,8 +158,10 @@ def convert(trajectory: dict, evaluation: dict | None = None, native: dict | Non
 
     def add_llm(pair, cost=None, extra_rest=None):
         step, hint = pair
-        if cost is not None:
+        if _recorded_cost(cost, step.get("usage", {}).values()):
             step["cost"] = cost
+        elif cost is not None:
+            extra_rest = {**(extra_rest or {}), "cost": cost}
         if extra_rest:
             step["native"] = {**step.get("native", {}), "extra": extra_rest}
         for call in step.get("toolCalls", []):
@@ -240,13 +248,16 @@ def convert(trajectory: dict, evaluation: dict | None = None, native: dict | Non
     info = trajectory.get("info") or {}
     stats = info.get("model_stats") or {}
     llm = [s for s in steps if s["type"] == "llm"]
+    prompt_tokens = sum(s.get("usage", {}).get("prompt", 0) for s in llm) or None
+    completion_tokens = sum(s.get("usage", {}).get("completion", 0) for s in llm) or None
+    cost = stats.get("instance_cost")
+    cost_recorded = _recorded_cost(cost, (prompt_tokens, completion_tokens))
     run = dict(
         status=exit_extra.get("exit_status") or info.get("exit_status"),
         submission=exit_extra.get("submission"), exception=exit_extra.get("exception_str"),
-        traceback=exit_extra.get("traceback"), cost=stats.get("instance_cost"),
-        apiCalls=stats.get("api_calls"),
-        promptTokens=sum(s.get("usage", {}).get("prompt", 0) for s in llm) or None,
-        completionTokens=sum(s.get("usage", {}).get("completion", 0) for s in llm) or None,
+        traceback=exit_extra.get("traceback"), cost=cost if cost_recorded else None,
+        apiCalls=stats.get("api_calls"), promptTokens=prompt_tokens,
+        completionTokens=completion_tokens,
         durationS=(max(times) - min(times)) if times else None)
 
     graded = None
@@ -264,7 +275,7 @@ def convert(trajectory: dict, evaluation: dict | None = None, native: dict | Non
     rest = _native(
         **(native or {}), trajectory=unused(trajectory, {"messages", "info"}),
         info=unused(info, {"model_stats", "exit_status"}),
-        model_stats=unused(stats, {"instance_cost", "api_calls"}), exit=exit_rest,
+        model_stats=unused(stats, {"instance_cost", "api_calls"} if cost_recorded else {"api_calls"}), exit=exit_rest,
         evaluation=evaluation_rest)
     return trace(CONVERTER, steps, timing="recorded" if times else None, run=run,
                  evaluation=graded, native=rest), counts
