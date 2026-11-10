@@ -18,14 +18,27 @@ import type {
 } from "@/lib/traces/display";
 
 type Kind = "llm" | "tool" | "tool-nz" | "tool-err" | "harness" | "context";
-const KIND: Record<Kind, { color: string; label: string }> = {
-  llm: { color: "var(--digital-blue)", label: "model turn" },
-  tool: { color: "var(--digital-green)", label: "tool ok" },
-  "tool-nz": { color: "var(--poppy)", label: "tool non-zero exit" },
-  "tool-err": { color: "var(--digital-red)", label: "tool error" },
-  harness: { color: "var(--plum)", label: "harness message" },
-  context: { color: "var(--stone)", label: "system / task / other" },
-};
+/* `color` marks a step's card. On the step strip only the kinds a reader hunts
+   for (failures, harness interventions) are colored; model turns and tool calls
+   alternate on agent runs, so coloring them too turns the strip into one band. */
+const KIND: Record<Kind, { color: string; label: string; flagged?: boolean }> =
+  {
+    llm: { color: "var(--digital-blue)", label: "model turn" },
+    tool: { color: "var(--stone)", label: "tool call" },
+    "tool-nz": {
+      color: "var(--poppy)",
+      label: "non-zero exit",
+      flagged: true,
+    },
+    "tool-err": {
+      color: "var(--digital-red)",
+      label: "tool error",
+      flagged: true,
+    },
+    harness: { color: "var(--plum)", label: "harness message", flagged: true },
+    context: { color: "var(--stone)", label: "system / task / other" },
+  };
+const STRIP_NEUTRAL = "color-mix(in srgb, var(--stone) 30%, white)";
 
 function kindOf(step: TraceStep): Kind {
   if (step.type === "llm") return "llm";
@@ -51,6 +64,7 @@ function searchText(step: TraceStep) {
   return step.content ?? "";
 }
 
+const TESTS_SHOWN = 2000;
 const int = (n?: number) => (n == null ? "–" : Math.round(n).toLocaleString());
 const money = (c?: number) =>
   c == null ? "–" : "$" + (c < 0.01 ? c.toFixed(4) : c.toFixed(2));
@@ -60,6 +74,14 @@ function duration(s?: number) {
   if (s < 90) return `${s.toFixed(1)} s`;
   if (s < 5400) return `${(s / 60).toFixed(1)} min`;
   return `${(s / 3600).toFixed(1)} h`;
+}
+
+/** A step's duration, when it has one. A zero span means the source had no
+ *  start time for the step (its start was set to its end), not an instant call. */
+function elapsed(step: { start?: number; end?: number }) {
+  return step.start != null && step.end != null && step.end > step.start
+    ? duration(step.end - step.start)
+    : null;
 }
 
 /* ---------- text with search highlighting ---------- */
@@ -213,7 +235,7 @@ function StepHead({
   index: number;
 }) {
   return (
-    <div className="mb-1.5 flex flex-wrap items-baseline justify-between gap-2 text-[0.6875rem] text-[var(--muted)]">
+    <div className="mb-1.5 flex flex-wrap items-baseline justify-between gap-2 text-[0.75rem] text-[var(--muted)]">
       <span className="text-[0.75rem] font-semibold text-[var(--ink)]">
         {title}
       </span>
@@ -284,9 +306,7 @@ function Llm({
       : null,
     u.cacheRead ? `${int(u.cacheRead)} cached` : null,
     step.cost != null ? money(step.cost) : null,
-    timed && step.start != null && step.end != null
-      ? duration(step.end - step.start)
-      : null,
+    timed ? elapsed(step) : null,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -311,11 +331,8 @@ function Llm({
       ) : null}
       {step.content ? (
         <div className="whitespace-pre-wrap break-words text-[0.8125rem] leading-6 text-[var(--ink)]">
-          <Highlight text={step.content} query={query} />
-          <Omitted
-            from={step.truncated?.content}
-            shown={step.content.length}
-          />
+          <Highlight text={step.content.trim()} query={query} />
+          <Omitted from={step.truncated?.content} shown={step.content.length} />
         </div>
       ) : null}
       {(step.toolCalls ?? []).map((call, i) => (
@@ -349,12 +366,16 @@ function Tool({
   query,
   expandAll,
   timed,
+  showCommand,
 }: {
   step: ToolStep;
   index: number;
   query: string;
   expandAll: boolean;
   timed: boolean;
+  /** The command is shown on the model turn above; repeat it only when that
+   *  turn made several calls, or the result matches none of its calls. */
+  showCommand: boolean;
 }) {
   const badge = step.error ? (
     <Badge tone="err">error</Badge>
@@ -365,10 +386,7 @@ function Tool({
       exit {step.exitCode}
     </Badge>
   );
-  const time =
-    timed && step.start != null && step.end != null
-      ? duration(step.end - step.start)
-      : undefined;
+  const time = (timed && elapsed(step)) || undefined;
   return (
     <>
       <StepHead
@@ -376,11 +394,13 @@ function Tool({
         meta={time}
         title={
           <span className="flex min-w-0 flex-wrap items-baseline gap-1.5">
-            <span>↳ {step.name ?? "tool"}</span>
+            <span>↳ {step.name ?? "tool"} output</span>
             {badge}
-            <span className="font-mono font-normal text-[var(--muted)]">
-              {firstLine(step.arguments)}
-            </span>
+            {showCommand && step.arguments ? (
+              <span className="font-mono font-normal text-[var(--muted)]">
+                {firstLine(step.arguments)}
+              </span>
+            ) : null}
           </span>
         }
       />
@@ -412,6 +432,19 @@ function Tool({
   );
 }
 
+/** The harness's exit status, as it reported it. Its vocabulary differs per
+ *  harness, so only a recorded exception marks it as an error. */
+function StatusBadge({ run }: { run: NonNullable<Trace["run"]> }) {
+  return (
+    <Badge
+      tone={run.exception ? "err" : "muted"}
+      title="Exit status reported by the agent harness"
+    >
+      {run.status ?? "status not recorded"}
+    </Badge>
+  );
+}
+
 /* ---------- result ---------- */
 function Result({ trace }: { trace: Trace }) {
   const [filter, setFilter] = useState("");
@@ -421,9 +454,10 @@ function Result({ trace }: { trace: Trace }) {
   const counts = new Map<string, number>();
   for (const t of tests) counts.set(t.status, (counts.get(t.status) ?? 0) + 1);
   const notPassed = tests.filter((t) => t.status !== "passed");
-  const shown = notPassed
-    .filter((t) => !filter || t.name.toLowerCase().includes(filter))
-    .slice(0, 2000);
+  const matching = notPassed.filter(
+    (t) => !filter || t.name.toLowerCase().includes(filter),
+  );
+  const shown = matching.slice(0, TESTS_SHOWN);
   const h3 = "mb-1.5 mt-4 text-[0.75rem] font-semibold text-[var(--ink)]";
   return (
     <section className="mt-4 rounded border border-[var(--line)] bg-white p-4">
@@ -431,10 +465,7 @@ function Result({ trace }: { trace: Trace }) {
         Result
       </h2>
       <div className="flex flex-wrap items-center gap-1.5 text-[0.75rem] text-[var(--muted)]">
-        Run status:{" "}
-        <Badge tone={run.status === "Submitted" ? "ok" : "err"}>
-          {run.status ?? "not recorded"}
-        </Badge>
+        Run status: <StatusBadge run={run} />
         {[...counts].map(([status, n]) => (
           <Chip key={status} label={status} value={n.toLocaleString()} />
         ))}
@@ -472,9 +503,7 @@ function Result({ trace }: { trace: Trace }) {
         <>
           <h3 className={h3}>Exception</h3>
           <Block
-            text={
-              run.exception + (run.traceback ? "\n\n" + run.traceback : "")
-            }
+            text={run.exception + (run.traceback ? "\n\n" + run.traceback : "")}
             lines={12}
             query=""
             expandAll={false}
@@ -484,12 +513,7 @@ function Result({ trace }: { trace: Trace }) {
       {run.submission ? (
         <>
           <h3 className={h3}>Submission</h3>
-          <Block
-            text={run.submission}
-            lines={12}
-            query=""
-            expandAll={false}
-          />
+          <Block text={run.submission} lines={12} query="" expandAll={false} />
         </>
       ) : null}
       {tests.length ? (
@@ -527,6 +551,12 @@ function Result({ trace }: { trace: Trace }) {
               </p>
             )}
           </div>
+          {matching.length > shown.length ? (
+            <p className="mt-1 text-[0.6875rem] text-[var(--muted)]">
+              Showing the first {shown.length.toLocaleString()} of{" "}
+              {matching.length.toLocaleString()}; filter to narrow the list.
+            </p>
+          ) : null}
         </>
       ) : null}
     </section>
@@ -534,7 +564,24 @@ function Result({ trace }: { trace: Trace }) {
 }
 
 /* ---------- viewer ---------- */
-export function TraceViewer({ trace }: { trace: Trace }) {
+/* Inline, the viewer is part of the page: it has no scroll area of its own, and
+   its toolbar sticks below the site header (which publishes its height as
+   --rd-header-offset). Full screen is an overlay with its own scroll area. */
+const PAGE_TOP = "var(--rd-header-offset, 0px)";
+/** The site header can slide back in after a jump up, so leave room for it. */
+const HEADER_ROOM = 80;
+
+export function TraceViewer({
+  trace,
+  subject,
+  onBack,
+}: {
+  trace: Trace;
+  /** The matrix row this run belongs to. */
+  subject?: string | null;
+  /** Scrolls back to where the run was picked from. */
+  onBack?: () => void;
+}) {
   const [input, setInput] = useState("");
   const [query, setQuery] = useState("");
   const [hitPos, setHitPos] = useState(-1);
@@ -542,8 +589,10 @@ export function TraceViewer({ trace }: { trace: Trace }) {
   const [showReasoning, setShowReasoning] = useState(false);
   const [expandAll, setExpandAll] = useState(false);
   const [fullScreen, setFullScreen] = useState(false);
-  const scroller = useRef<HTMLDivElement>(null);
-  const searchBox = useRef<HTMLInputElement>(null);
+  const overlay = useRef<HTMLDivElement>(null);
+  const toolbar = useRef<HTMLDivElement>(null);
+  const timeline = useRef<HTMLDivElement>(null);
+  const toggle = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     const t = setTimeout(() => {
@@ -553,9 +602,16 @@ export function TraceViewer({ trace }: { trace: Trace }) {
     return () => clearTimeout(t);
   }, [input]);
 
+  const wasFullScreen = useRef(false);
   useEffect(() => {
-    if (!fullScreen) return;
-    scroller.current?.focus();
+    if (!fullScreen) {
+      // Closing re-creates the toggle button inline; give it focus back.
+      if (wasFullScreen.current) toggle.current?.focus();
+      wasFullScreen.current = false;
+      return;
+    }
+    wasFullScreen.current = true;
+    overlay.current?.focus();
     const close = (e: KeyboardEvent) => {
       if (e.key === "Escape") setFullScreen(false);
     };
@@ -575,18 +631,33 @@ export function TraceViewer({ trace }: { trace: Trace }) {
     [steps, query],
   );
   const hitSet = useMemo(() => new Set(hits), [hits]);
+  // How many calls the model turn that made each call made in total.
+  const callsInTurn = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const s of steps)
+      if (s.type === "llm")
+        for (const c of s.toolCalls ?? [])
+          if (c.id) m.set(c.id, s.toolCalls!.length);
+    return m;
+  }, [steps]);
   const timed = trace.timing === "recorded" || trace.timing === "partial";
 
   const llm = steps.filter((s): s is LlmStep => s.type === "llm");
   const toolCount = steps.filter((s) => s.type === "tool").length;
   const model = llm.find((s) => s.model)?.model;
+  const hasReasoning = llm.some((s) => s.reasoning);
   const run = trace.run ?? {};
   const ev = trace.evaluation;
 
   function jump(i: number) {
     setFocus(i);
-    const el = scroller.current?.querySelector<HTMLElement>(`[data-step="${i}"]`);
-    el?.scrollIntoView({ block: "start" });
+    const el = timeline.current?.querySelector<HTMLElement>(
+      `[data-step="${i}"]`,
+    );
+    if (!el) return;
+    const bar = toolbar.current?.offsetHeight ?? 0;
+    el.style.scrollMarginTop = `${bar + (fullScreen ? 8 : HEADER_ROOM)}px`;
+    el.scrollIntoView({ block: "start" });
   }
   function nextHit(dir: number) {
     if (!hits.length) return;
@@ -594,298 +665,315 @@ export function TraceViewer({ trace }: { trace: Trace }) {
     setHitPos(pos);
     jump(hits[pos]);
   }
-  function nextTurn(dir: number) {
-    const turns = steps.flatMap((s, i) => (s.type === "llm" ? [i] : []));
-    if (!turns.length) return;
-    const current = focus ?? -1;
-    const target =
-      dir > 0
-        ? (turns.find((i) => i > current) ?? turns.at(-1)!)
-        : ([...turns].reverse().find((i) => i < current) ?? turns[0]);
-    jump(target);
-  }
-  function onKey(e: React.KeyboardEvent) {
-    if ((e.target as HTMLElement).matches("input, textarea")) return;
-    if (e.key === "/") {
-      e.preventDefault();
-      searchBox.current?.focus();
-    } else if (e.key === "j") nextTurn(1);
-    else if (e.key === "k") nextTurn(-1);
-    else if (e.key === "Escape" && fullScreen) setFullScreen(false);
-  }
 
   let turn = 0;
-  const used = [...new Set(kinds)];
+  const flagged = (Object.keys(KIND) as Kind[]).filter(
+    (k) => KIND[k].flagged && kinds.includes(k),
+  );
   const agentOf = (s: TraceStep) => s.agent ?? null;
+  const button =
+    "rounded border border-[var(--line)] bg-white px-2 py-0.5 text-[0.6875rem] text-[var(--muted)] hover:border-[var(--muted)]";
 
-  const viewer = (
-    <div
-      className={
-        fullScreen
-          ? "fixed inset-0 z-[100] flex flex-col bg-[var(--fog-light)] p-4"
-          : "flex min-w-0 flex-col"
-      }
-      role={fullScreen ? "dialog" : undefined}
-      aria-modal={fullScreen || undefined}
-      aria-label={fullScreen ? "Trace" : undefined}
-    >
-      <div
-        ref={scroller}
-        tabIndex={0}
-        onKeyDown={onKey}
-        className={`overflow-auto rounded bg-white outline-none focus-visible:ring-2 focus-visible:ring-[var(--lagunita)] ${fullScreen ? "flex-1" : "max-h-[48rem]"}`}
-      >
-        {/* Header */}
-        <section className="border-b border-[var(--line)] p-4">
-          <div className="flex flex-wrap items-center gap-2 text-[0.75rem]">
-            {model ? (
-              <span className="font-semibold text-[var(--ink)]">{model}</span>
-            ) : null}
-            <Badge
-              tone={run.status === "Submitted" ? "ok" : "err"}
-              title="Exit status recorded by the agent harness"
-            >
-              {run.status ?? "status not recorded"}
-            </Badge>
-            {ev?.errorCode ? (
-              <Badge tone="err" title="The grader reported an error; see Result">
-                evaluation: {ev.errorCode}
-              </Badge>
-            ) : null}
-            {ev?.total && ev.notRun === ev.total ? (
-              <Badge tone="warn">no tests ran</Badge>
-            ) : null}
-            {!ev ? <Badge tone="muted">not graded</Badge> : null}
-            <button
-              type="button"
-              onClick={() => setFullScreen(!fullScreen)}
-              className="ml-auto rounded border border-[var(--line)] bg-white px-2 py-0.5 text-[0.6875rem] text-[var(--muted)] hover:border-[var(--muted)]"
-            >
-              {fullScreen ? "Close full screen" : "Open full screen"}
-            </button>
-          </div>
-          {ev?.total ? (
-            <div className="mt-2 flex flex-wrap items-center gap-3 text-[0.75rem] text-[var(--muted)]">
-              <div
-                className="h-2 w-48 overflow-hidden rounded bg-[var(--fog-light)]"
-                role="img"
-                aria-label={`${ev.passed ?? 0} of ${ev.total} tests passed`}
-              >
-                <div
-                  className="h-full bg-[var(--digital-green)]"
-                  style={{ width: `${((ev.passed ?? 0) / ev.total) * 100}%` }}
-                />
-              </div>
-              <span>
-                <b className="text-[var(--ink)]">
-                  {(ev.passed ?? 0).toLocaleString()} /{" "}
-                  {ev.total.toLocaleString()}
-                </b>{" "}
-                tests passed in this run&apos;s evaluation
-              </span>
-            </div>
+  const content = (
+    <>
+      {/* Header */}
+      <section className="rounded-t border-b border-[var(--line)] bg-white p-4">
+        <div className="flex flex-wrap items-center gap-2 text-[0.75rem]">
+          {subject ? (
+            <span className="font-semibold text-[var(--ink)]">{subject}</span>
           ) : null}
-          <div className="mt-2 flex flex-wrap gap-1.5">
-            <Chip label="cost" value={money(run.cost)} />
-            <Chip label="model turns" value={int(llm.length)} />
-            {run.apiCalls != null && run.apiCalls !== llm.length ? (
-              <Chip label="API calls" value={int(run.apiCalls)} />
-            ) : null}
-            <Chip label="tool calls" value={int(toolCount)} />
-            <Chip label="prompt tokens" value={int(run.promptTokens)} />
-            <Chip label="output tokens" value={int(run.completionTokens)} />
-            {timed ? (
-              <Chip label="duration" value={duration(run.durationS)} />
-            ) : null}
-          </div>
-        </section>
-
-        {/* Toolbar: search + step strip, sticky inside the pane */}
-        <div className="sticky top-0 z-10 border-b border-[var(--line)] bg-white/95 px-4 pb-2 pt-3 backdrop-blur">
-          <div className="flex flex-wrap items-center gap-2">
-            <input
-              ref={searchBox}
-              type="search"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  const q = input.trim().toLowerCase();
-                  if (q !== query) setQuery(q);
-                  else nextHit(e.shiftKey ? -1 : 1);
-                }
-              }}
-              placeholder="Search this trace (commands, outputs, messages)…"
-              aria-label="Search this trace"
-              className="min-w-44 flex-1 rounded border border-[var(--line)] px-2.5 py-1 text-[0.8125rem]"
-            />
+          {model ? (
             <span
-              className="min-w-16 text-[0.6875rem] text-[var(--muted)]"
-              aria-live="polite"
+              className="font-mono text-[0.6875rem] text-[var(--muted)]"
+              title="Model ID the provider reported for this run"
             >
-              {query
-                ? hitPos >= 0
-                  ? `${hitPos + 1} / ${hits.length} steps`
-                  : `${hits.length} step${hits.length === 1 ? "" : "s"}`
-                : ""}
+              {model}
             </span>
-            {[
-              ["↑", -1, "Previous match"],
-              ["↓", 1, "Next match"],
-            ].map(([label, dir, name]) => (
-              <button
-                key={name as string}
-                type="button"
-                aria-label={name as string}
-                disabled={!hits.length}
-                onClick={() => nextHit(dir as number)}
-                className="rounded border border-[var(--line)] bg-white px-2 py-0.5 text-[0.75rem] disabled:opacity-40"
-              >
-                {label}
-              </button>
-            ))}
+          ) : null}
+          <StatusBadge run={run} />
+          {ev?.errorCode ? (
+            <Badge tone="err" title="The grader reported an error; see Result">
+              evaluation: {ev.errorCode}
+            </Badge>
+          ) : null}
+          {ev?.total && ev.notRun === ev.total ? (
+            <Badge tone="warn">no tests ran</Badge>
+          ) : null}
+          {!ev ? <Badge tone="muted">not graded</Badge> : null}
+          <button
+            ref={toggle}
+            type="button"
+            onClick={() => setFullScreen(!fullScreen)}
+            className={`ml-auto ${button}`}
+          >
+            {fullScreen ? "Close full screen" : "Open full screen"}
+          </button>
+        </div>
+        {ev?.total ? (
+          <div className="mt-2 flex flex-wrap items-center gap-3 text-[0.75rem] text-[var(--muted)]">
+            <div
+              className="h-2 w-48 overflow-hidden rounded bg-[var(--fog-light)]"
+              role="img"
+              aria-label={`${ev.passed ?? 0} of ${ev.total} tests passed`}
+            >
+              <div
+                className="h-full bg-[var(--digital-green)]"
+                style={{ width: `${((ev.passed ?? 0) / ev.total) * 100}%` }}
+              />
+            </div>
+            <span>
+              <b className="text-[var(--ink)]">
+                {(ev.passed ?? 0).toLocaleString()} /{" "}
+                {ev.total.toLocaleString()}
+              </b>{" "}
+              tests passed in this run&apos;s evaluation
+            </span>
+          </div>
+        ) : null}
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          <Chip
+            label="cost"
+            value={run.cost != null ? money(run.cost) : "not recorded"}
+          />
+          <Chip label="model turns" value={int(llm.length)} />
+          {run.apiCalls != null && run.apiCalls !== llm.length ? (
+            <Chip label="API calls" value={int(run.apiCalls)} />
+          ) : null}
+          <Chip label="tool calls" value={int(toolCount)} />
+          <Chip label="prompt tokens" value={int(run.promptTokens)} />
+          <Chip label="output tokens" value={int(run.completionTokens)} />
+          {timed ? (
+            <Chip label="duration" value={duration(run.durationS)} />
+          ) : null}
+        </div>
+      </section>
+
+      {/* Toolbar: search and the step strip */}
+      <div
+        ref={toolbar}
+        className="sticky z-10 border-b border-[var(--line)] bg-white/95 px-4 pb-2 pt-3 backdrop-blur transition-[top] duration-300"
+        style={{ top: fullScreen ? 0 : PAGE_TOP }}
+      >
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            type="search"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                const q = input.trim().toLowerCase();
+                if (q !== query) setQuery(q);
+                else nextHit(e.shiftKey ? -1 : 1);
+              }
+            }}
+            placeholder="Search this trace (commands, outputs, messages)…"
+            aria-label="Search this trace"
+            className="min-w-44 flex-1 rounded border border-[var(--line)] px-2.5 py-1 text-[0.8125rem]"
+          />
+          <span
+            className="min-w-16 text-[0.6875rem] text-[var(--muted)]"
+            aria-live="polite"
+          >
+            {query
+              ? hitPos >= 0
+                ? `${hitPos + 1} / ${hits.length} steps`
+                : `${hits.length} step${hits.length === 1 ? "" : "s"}`
+              : ""}
+          </span>
+          {[
+            ["↑", -1, "Previous match"],
+            ["↓", 1, "Next match"],
+          ].map(([label, dir, name]) => (
+            <button
+              key={name as string}
+              type="button"
+              aria-label={name as string}
+              disabled={!hits.length}
+              onClick={() => nextHit(dir as number)}
+              className="rounded border border-[var(--line)] bg-white px-2 py-0.5 text-[0.75rem] disabled:opacity-40"
+            >
+              {label}
+            </button>
+          ))}
+          {hasReasoning ? (
             <label className="flex cursor-pointer items-center gap-1 text-[0.6875rem] text-[var(--muted)]">
               <input
                 type="checkbox"
                 checked={showReasoning}
                 onChange={(e) => setShowReasoning(e.target.checked)}
               />
-              reasoning
+              show reasoning
             </label>
-            <label className="flex cursor-pointer items-center gap-1 text-[0.6875rem] text-[var(--muted)]">
-              <input
-                type="checkbox"
-                checked={expandAll}
-                onChange={(e) => setExpandAll(e.target.checked)}
-              />
-              expand all output
-            </label>
-          </div>
-          <div
-            className="mt-2 flex h-4 overflow-hidden rounded bg-[var(--fog-light)]"
-            role="group"
-            aria-label="Steps; select one to jump to it"
-          >
-            {kinds.map((k, i) => (
-              <button
-                key={i}
-                type="button"
-                tabIndex={-1}
-                aria-label={`Step ${i}: ${KIND[k].label}`}
-                title={`#${i} ${KIND[k].label}`}
-                onClick={() => jump(i)}
-                className="relative min-w-px flex-1"
+          ) : null}
+          <label className="flex cursor-pointer items-center gap-1 text-[0.6875rem] text-[var(--muted)]">
+            <input
+              type="checkbox"
+              checked={expandAll}
+              onChange={(e) => setExpandAll(e.target.checked)}
+            />
+            expand all output
+          </label>
+          {onBack && !fullScreen ? (
+            <button type="button" onClick={onBack} className={button}>
+              ↑ Back to matrix
+            </button>
+          ) : null}
+        </div>
+        <div
+          className="mt-2 flex h-4 overflow-hidden rounded"
+          style={{ background: STRIP_NEUTRAL }}
+          role="group"
+          aria-label="Steps; select one to jump to it"
+        >
+          {kinds.map((k, i) => (
+            <button
+              key={i}
+              type="button"
+              tabIndex={-1}
+              aria-label={`Step ${i}: ${KIND[k].label}`}
+              title={`#${i} ${KIND[k].label}`}
+              onClick={() => jump(i)}
+              className="relative min-w-px flex-1 hover:brightness-75"
+              style={{
+                background: KIND[k].flagged ? KIND[k].color : STRIP_NEUTRAL,
+              }}
+            >
+              {hitSet.has(i) ? (
+                <span className="absolute inset-x-0 -top-px h-2 min-w-[3px] bg-[var(--ink)]" />
+              ) : null}
+              {focus === i ? (
+                <span className="absolute inset-x-0 bottom-0 h-1 min-w-[3px] bg-[var(--lagunita)]" />
+              ) : null}
+            </button>
+          ))}
+        </div>
+        <div className="mt-1 flex flex-wrap gap-3 text-[0.625rem] text-[var(--muted)]">
+          {flagged.map((k) => (
+            <span key={k} className="flex items-center gap-1">
+              <span
+                className="inline-block size-2 rounded-sm"
                 style={{ background: KIND[k].color }}
-              >
-                {hitSet.has(i) ? (
-                  <span className="absolute inset-x-0 -top-px h-2 min-w-[3px] bg-[var(--ink)]" />
-                ) : null}
-              </button>
-            ))}
-          </div>
-          <div className="mt-1 flex flex-wrap gap-3 text-[0.625rem] text-[var(--muted)]">
-            {used.map((k) => (
-              <span key={k} className="flex items-center gap-1">
-                <span
-                  className="inline-block size-2 rounded-sm"
-                  style={{ background: KIND[k].color }}
-                />
-                {KIND[k].label}
-              </span>
-            ))}
-            <span className="ml-auto">
-              <kbd>/</kbd> search · <kbd>j</kbd>/<kbd>k</kbd> next/previous
-              turn
+              />
+              {KIND[k].label}
             </span>
-          </div>
-        </div>
-
-        {/* Timeline */}
-        <div className="flex flex-col gap-2 p-4">
-          {steps.map((step, i) => {
-            const k = kinds[i];
-            const agent = agentOf(step);
-            const newAgent = agent && agent !== agentOf(steps[i - 1] ?? step);
-            const border =
-              step.type === "tool"
-                ? k === "tool-err"
-                  ? "border-l-[3px] border-l-[var(--digital-red)]"
-                  : k === "tool-nz"
-                    ? "border-l-[3px] border-l-[var(--poppy)]"
-                    : ""
-                : `border-l-[3px]`;
-            const style =
-              step.type === "tool"
-                ? undefined
-                : { borderLeftColor: KIND[k].color };
-            const tint =
-              k === "harness"
-                ? "bg-[color-mix(in_srgb,var(--plum)_6%,white)]"
-                : step.type === "tool"
-                  ? "ml-7 bg-[var(--fog-light)]"
-                  : "bg-white";
-            return (
-              <Fragment key={i}>
-                {newAgent || (agent && i === 0) ? (
-                  <h3 className="mt-2 text-[0.6875rem] uppercase tracking-wide text-[var(--muted)]">
-                    {agent}
-                  </h3>
-                ) : null}
-                <div
-                  data-step={i}
-                  className={`scroll-mt-28 rounded border border-[var(--line)] px-3 py-2.5 ${border} ${tint} ${focus === i ? "outline outline-2 outline-[var(--lagunita)]" : ""}`}
-                  style={style}
-                >
-                  {step.type === "message" ? (
-                    <Message
-                      step={step}
-                      index={i}
-                      query={query}
-                      expandAll={expandAll}
-                    />
-                  ) : step.type === "llm" ? (
-                    <Llm
-                      step={step}
-                      index={i}
-                      turn={++turn}
-                      query={query}
-                      expandAll={expandAll}
-                      showReasoning={showReasoning}
-                      timed={timed}
-                    />
-                  ) : step.type === "tool" ? (
-                    <Tool
-                      step={step}
-                      index={i}
-                      query={query}
-                      expandAll={expandAll}
-                      timed={timed}
-                    />
-                  ) : (
-                    <>
-                      <StepHead title={`Event · ${step.name}`} index={i} />
-                      {step.content ? (
-                        <Block
-                          text={step.content}
-                          lines={8}
-                          query={query}
-                          expandAll={expandAll}
-                        />
-                      ) : null}
-                    </>
-                  )}
-                </div>
-              </Fragment>
-            );
-          })}
-        </div>
-        <div className="px-4 pb-4">
-          <Result trace={trace} />
+          ))}
+          <span className="flex items-center gap-1">
+            <span
+              className="inline-block size-2 rounded-sm"
+              style={{ background: STRIP_NEUTRAL }}
+            />
+            {flagged.length ? "other steps" : "steps"} ·{" "}
+            {steps.length.toLocaleString()} in all
+          </span>
         </div>
       </div>
-    </div>
+
+      {/* Timeline */}
+      <div ref={timeline} className="flex flex-col gap-2 bg-white p-4">
+        {steps.map((step, i) => {
+          const k = kinds[i];
+          const agent = agentOf(step);
+          const newAgent = agent && agent !== agentOf(steps[i - 1] ?? step);
+          const border =
+            step.type === "tool"
+              ? k === "tool-err"
+                ? "border-l-[3px] border-l-[var(--digital-red)]"
+                : k === "tool-nz"
+                  ? "border-l-[3px] border-l-[var(--poppy)]"
+                  : ""
+              : `border-l-[3px]`;
+          const tint =
+            k === "harness"
+              ? "bg-[color-mix(in_srgb,var(--plum)_6%,white)]"
+              : step.type === "tool"
+                ? "ml-7 bg-[var(--fog-light)]"
+                : "bg-white";
+          return (
+            <Fragment key={i}>
+              {newAgent || (agent && i === 0) ? (
+                <h3 className="mt-2 text-[0.6875rem] uppercase tracking-wide text-[var(--muted)]">
+                  {agent}
+                </h3>
+              ) : null}
+              <div
+                data-step={i}
+                className={`rounded border border-[var(--line)] px-3 py-2.5 ${border} ${tint} ${focus === i ? "outline outline-2 outline-[var(--lagunita)]" : ""}`}
+                style={
+                  step.type === "tool"
+                    ? undefined
+                    : { borderLeftColor: KIND[k].color }
+                }
+              >
+                {step.type === "message" ? (
+                  <Message
+                    step={step}
+                    index={i}
+                    query={query}
+                    expandAll={expandAll}
+                  />
+                ) : step.type === "llm" ? (
+                  <Llm
+                    step={step}
+                    index={i}
+                    turn={++turn}
+                    query={query}
+                    expandAll={expandAll}
+                    showReasoning={showReasoning}
+                    timed={timed}
+                  />
+                ) : step.type === "tool" ? (
+                  <Tool
+                    step={step}
+                    index={i}
+                    query={query}
+                    expandAll={expandAll}
+                    timed={timed}
+                    showCommand={
+                      !step.callId || callsInTurn.get(step.callId) !== 1
+                    }
+                  />
+                ) : (
+                  <>
+                    <StepHead title={`Event · ${step.name}`} index={i} />
+                    {step.content ? (
+                      <Block
+                        text={step.content}
+                        lines={8}
+                        query={query}
+                        expandAll={expandAll}
+                      />
+                    ) : null}
+                  </>
+                )}
+              </div>
+            </Fragment>
+          );
+        })}
+      </div>
+      <div className="rounded-b bg-white px-4 pb-4">
+        <Result trace={trace} />
+      </div>
+    </>
   );
+
+  if (!fullScreen) return <div className="min-w-0">{content}</div>;
   // Full screen renders into <body>: an animated ancestor would otherwise trap `fixed`.
-  return fullScreen ? createPortal(viewer, document.body) : viewer;
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[100] flex flex-col bg-[var(--fog-light)] p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Trace"
+    >
+      <div
+        ref={overlay}
+        tabIndex={-1}
+        className="flex-1 overflow-auto overscroll-contain rounded bg-white outline-none"
+      >
+        {content}
+      </div>
+    </div>,
+    document.body,
+  );
 }
